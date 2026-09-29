@@ -1,0 +1,127 @@
+    def fluence(self, eps_x, eps_z):
+        return self.dt * (np.sum(eps_x**2)+np.sum(eps_z**2))
+
+    def evaluate_fidelity(self, eps_x, eps_z):
+        psi = self.psi_i.copy()
+
+        for t_idx in range(self.time_steps):
+            psi = self.trottpropor.step_trotter(psi, eps_x[t_idx], eps_z[t_idx])
+
+        return self.fidelity(psi)
+
+    def dmorph_direction(self, eps_x, eps_z):
+        grad_x, grad_z, fidelity = self.compute_gradient(eps_x, eps_z)
+
+        f_x = -eps_x
+        f_z = -eps_z
+
+        numerator = np.dot(grad_x, f_x) + np.dot(grad_z, f_z)
+        denominator = np.dot(grad_x, grad_x) + np.dot(grad_z, grad_z)
+
+        if denominator < 1e-16:
+            direction_x = np.zeros_like(eps_x)
+            direction_z = np.zeros_like(eps_z)
+        else:
+            coeff = numerator / denominator
+            direction_x = f_x - coeff * grad_x
+            direction_z = f_z - coeff * grad_z
+
+        return direction_x, direction_z, fidelity
+
+    def dmorph_rk45(self, h_start):
+        B = np.zeros((7,7))
+        CH = np.array([0, 47/450, 0, 12/25, 32/225, 1/30, 6/25])
+        CT = np.array([0, 1/150, 0, -3/100, 16/75, 1/20, -6/25])
+        B[2][1], B[3][1], B[3][2], B[4][1], B[4][2], B[4][3], B[5][1], B[5][2], B[5][3], B[5][4], B[6][1], B[6][2], B[6][3], B[6][4], B[6][5] = 2/9, 1/12, 1/4, 69/128, -243/128, 135/64, -17/12, 27/4, -27/5, 16/15, 65/432, -5/16, 13/16, 4/27, 5/144
+
+        err_tol = 1e-6
+        level_tol = 1e-4
+        h_loc = h_start
+
+        while (True):
+            kx = np.zeros((7, self.time_steps))
+            kz = np.zeros((7, self.time_steps))
+
+            for i in range(1, 7):
+                eps_x_stage = self.eps_x.copy()
+                eps_z_stage = self.eps_z.copy()
+
+                for j in range(i):
+                    eps_x_stage += B[i][j] * kx[j]
+                    eps_z_stage += B[i][j] * kz[j]
+
+                direction_x, direction_z, fid = self.dmorph_direction(eps_x_stage, eps_z_stage)
+                if i==1:
+                    fidelity_before=fid
+                    fluence_before = self.fluence(self.eps_x, self.eps_z)
+
+                kx[i] = h_loc * direction_x
+                kz[i] = h_loc * direction_z
+            
+            TE_x = np.zeros(self.time_steps)
+            TE_z = np.zeros(self.time_steps)
+
+            for i in range(1, 7):
+                TE_x += CT[i] * kx[i]
+                TE_z += CT[i] * kz[i]
+
+            flag = True
+            max_decay_rate = 9999
+
+            for t in range(self.time_steps):
+                if abs(TE_x[t]) > err_tol:
+                    flag = False
+                    max_decay_rate = min(max_decay_rate, err_tol / abs(TE_x[t]))
+
+                if abs(TE_z[t]) > err_tol:
+                    flag = False
+                    max_decay_rate = min(max_decay_rate, err_tol / abs(TE_z[t]))
+
+            h_used = h_loc
+            h_loc = 0.9 * h_loc * max_decay_rate**(0.2)
+
+            if flag:
+                new_eps_x = self.eps_x.copy()
+                new_eps_z = self.eps_z.copy()
+
+                for i in range(1, 7):
+                    new_eps_x += CH[i] * kx[i]
+                    new_eps_z += CH[i] * kz[i]
+		
+                candidate_fidelity = self.evaluate_fidelity(new_eps_x, new_eps_z)
+                candidate_fluence = self.fluence(new_eps_x, new_eps_z)
+                level_ok = abs(candidate_fidelity - self.dmorph_level) <= level_tol
+                target_ok = candidate_fidelity >= self.dmorph_target
+                fluence_ok = candidate_fluence < fluence_before
+
+                if level_ok and fluence_ok and target_ok:
+                    self.eps_x = new_eps_x
+                    self.eps_z = new_eps_z
+                    self.last_dmorph_ds = h_used
+
+                    return candidate_fidelity, candidate_fluence, h_loc
+                else:
+                    h_loc = 0.5 * h_used
+                    continue
+
+    def optimize_dmorph(self, max_iterations=100, h_start=0.05, verbose=True):
+        fidelity_history = []
+        fluence_history = []
+        ds_history = []
+
+        h = h_start
+
+        self.dmorph_level = self.evaluate_fidelity(self.eps_x, self.eps_z)
+        self.dmorph_target = 0.99
+
+        for iteration in range(max_iterations):
+            current_fidelity, current_fluence, h = self.dmorph_rk45(h)
+
+            fidelity_history.append(current_fidelity)
+            fluence_history.append(current_fluence)
+            ds_history.append(self.last_dmorph_ds)
+
+            if verbose and (iteration % 10 == 0):
+                print(f"D-MORPH {iteration:4d} | " f"Fidelity: {current_fidelity:.6f} | " f"Fluence: {current_fluence:.6e} | " f"ds used: {self.last_dmorph_ds:.3e} | "f"next ds: {h:.3e}")
+
+        return fidelity_history, fluence_history, ds_history, self.eps_x, self.eps_z
