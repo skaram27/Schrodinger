@@ -18,7 +18,7 @@
         numerator = np.dot(grad_x, f_x) + np.dot(grad_z, f_z)
         denominator = np.dot(grad_x, grad_x) + np.dot(grad_z, grad_z)
 
-        if denominator < 1e-16:
+        if denominator < 1e-12:
             direction_x = np.zeros_like(eps_x)
             direction_z = np.zeros_like(eps_z)
         else:
