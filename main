@@ -204,7 +204,7 @@ def main():
 
     plt.tight_layout()
     #plt.show()
-    figure_filename = f"spin8_results_{job_id}.png"
+    figure_filename = f"spin*_results_{job_id}.png" #replace * with number of spins
     plt.savefig(figure_filename, dpi=200, bbox_inches="tight")
     plt.close()
 
