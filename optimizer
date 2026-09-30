@@ -1,0 +1,288 @@
+import numpy as np
+import scipy.linalg as la
+
+class FieldOptimizer:
+    def __init__(self, trottpropor, psi_i, psi_f, T, time_steps, ds=0.05):
+        self.trottpropor = trottpropor
+        self.psi_i = np.array(psi_i, dtype=complex)
+        self.psi_f = np.array(psi_f, dtype=complex)
+        self.T = T
+        self.time_steps = time_steps
+        self.dt = self.trottpropor.dt
+        self.ds = ds
+        t = np.arange(self.time_steps) * self.dt
+
+        self.eps_x = 0.02 * (np.sin(0.5*t) + np.sin(1.1*t + 0.4) + np.sin(1.9*t + 1.0))
+
+        self.eps_z = 0.15 * (np.sin(0.7*t + 0.2) + np.sin(1.4*t + 0.8) + np.sin(2.3*t + 1.3))
+
+        self.mu_x = self.trottpropor.mu_x
+        self.mu_z = self.trottpropor.mu_z
+
+    def fidelity(self, state):
+        overlap = np.vdot(self.psi_f, state)
+        return float(np.abs(overlap) ** 2)
+
+    def back_prop(self, state, eps_x, eps_z):
+        psi = state.copy()
+        h_ctrl = eps_x * self.mu_x + eps_z * self.mu_z
+        u_ctrl_dag = la.expm(1.0j * h_ctrl * self.trottpropor.dr)
+
+        for i in range(self.trottpropor.n_substeps):
+            for half in self.trottpropor.half_step_unitaries:
+                psi = half.conj().T @ psi
+
+            psi = u_ctrl_dag @ psi
+
+            for half in reversed(self.trottpropor.half_step_unitaries):
+                psi = half.conj().T @ psi
+
+        return psi
+
+    def backpropagate_target(self, eps_x_seq, eps_z_seq):
+        costates = [None] * self.time_steps
+        current_costate = self.psi_f.copy()
+
+        for step in reversed(range(self.time_steps)):
+            costates[step] = current_costate.copy()
+            current_costate = self.back_prop(current_costate, eps_x_seq[step], eps_z_seq[step])
+
+        return costates
+
+
+    def compute_gradient(self, eps_x, eps_z):
+        costates = self.backpropagate_target(eps_x, eps_z)
+
+        states = [self.psi_i.copy()]
+        current_psi = self.psi_i.copy()
+
+        for k in range(self.time_steps):
+            current_psi = self.trottpropor.step_trotter(current_psi, eps_x[k], eps_z[k])
+            states.append(current_psi.copy())
+
+        
+        overlap = np.vdot(self.psi_f, states[-1])
+
+        grad_x = np.zeros(self.time_steps)
+        grad_z = np.zeros(self.time_steps)
+
+        for k in range(self.time_steps):
+            psi_t = states[k + 1]
+            chi_t = costates[k]
+
+            mat_elem_x = np.vdot(chi_t, self.mu_x @ psi_t)
+            mat_elem_z = np.vdot(chi_t, self.mu_z @ psi_t)
+
+            grad_x[k] = 2.0 * np.imag(np.conj(overlap) * mat_elem_x)
+            grad_z[k] = 2.0 * np.imag(np.conj(overlap) * mat_elem_z)
+
+        fidelity_val = float(np.abs(overlap) ** 2)
+
+        return grad_x, grad_z, fidelity_val
+
+    def fluence(self, eps_x, eps_z):
+        return self.dt * (np.sum(eps_x**2)+np.sum(eps_z**2))
+
+    def evaluate_fidelity(self, eps_x, eps_z):
+        psi = self.psi_i.copy()
+
+        for t_idx in range(self.time_steps):
+            psi = self.trottpropor.step_trotter(psi, eps_x[t_idx], eps_z[t_idx])
+
+        return self.fidelity(psi)
+
+    def dmorph_direction(self, eps_x, eps_z):
+        grad_x, grad_z, fidelity = self.compute_gradient(eps_x, eps_z)
+
+        f_x = -eps_x
+        f_z = -eps_z
+
+        numerator = np.dot(grad_x, f_x) + np.dot(grad_z, f_z)
+        denominator = np.dot(grad_x, grad_x) + np.dot(grad_z, grad_z)
+
+        if denominator < 1e-12:
+            direction_x = np.zeros_like(eps_x)
+            direction_z = np.zeros_like(eps_z)
+        else:
+            coeff = numerator / denominator
+            direction_x = f_x - coeff * grad_x
+            direction_z = f_z - coeff * grad_z
+
+        return direction_x, direction_z, fidelity
+
+    def rk45(self):
+        B = np.zeros((7,7))
+        CH = np.array([0, 47/450, 0, 12/25, 32/225, 1/30, 6/25])
+        CT = np.array([0, 1/150, 0, -3/100, 16/75, 1/20, -6/25])
+        B[2][1], B[3][1], B[3][2], B[4][1], B[4][2], B[4][3], B[5][1], B[5][2], B[5][3], B[5][4], B[6][1], B[6][2], B[6][3], B[6][4], B[6][5] = 2/9, 1/12, 1/4, 69/128, -243/128, 135/64,  -17/12, 27/4, -27/5, 16/15, 65/432, -5/16, 13/16, 4/27, 5/144
+        err_tol = 1e-6
+        h_loc = self.ds
+        while(True):
+            kx = np.zeros((7, self.time_steps))
+            kz = np.zeros((7, self.time_steps))
+            for i in range(1,7):
+                eps_x_stage = self.eps_x.copy()
+                eps_z_stage = self.eps_z.copy()
+                for j in range(i):
+                    eps_x_stage += B[i][j] * kx[j]
+                    eps_z_stage += B[i][j] * kz[j]
+                grad_x, grad_z, fid = self.compute_gradient(eps_x_stage, eps_z_stage)
+                if i==1:
+                    self.last_grad_x_norm = np.linalg.norm(grad_x)
+                    self.last_grad_z_norm = np.linalg.norm(grad_z)
+                kx[i] = h_loc * grad_x
+                kz[i] = h_loc * grad_z
+
+            TE_x = np.zeros(self.time_steps)
+            TE_z = np.zeros(self.time_steps)
+        
+            for i in range(1,7):
+                TE_x += CT[i] * kx[i]
+                TE_z += CT[i] * kz[i]
+        
+            flag = True
+            max_decay_rate = 9999
+            for t in range(self.time_steps):
+                if abs(TE_x[t])>err_tol:
+                    flag = False
+                    max_decay_rate = min(max_decay_rate, err_tol / abs(TE_x[t]))
+                if abs(TE_z[t])>err_tol:
+                    flag = False
+                    max_decay_rate = min(max_decay_rate, err_tol / abs(TE_z[t]))
+            h_used = h_loc
+            h_loc = 0.9 * h_loc * max_decay_rate**(0.2)
+            if flag:
+                new_eps_x = self.eps_x.copy()
+                new_eps_z = self.eps_z.copy()
+        
+                for i in range(1,7):
+                    new_eps_x += CH[i] * kx[i]
+                    new_eps_z += CH[i] * kz[i]
+                self.eps_x = new_eps_x
+                self.eps_z = new_eps_z
+                self.last_ds = h_used
+                self.ds = h_loc
+
+                current_psi = self.psi_i.copy()
+                for t_idx in range(self.time_steps):
+                    current_psi = self.trottpropor.step_trotter(current_psi, self.eps_x[t_idx], self.eps_z[t_idx])
+
+                return self.fidelity(current_psi)
+
+    def dmorph_rk45(self, h_start):
+        B = np.zeros((7,7))
+        CH = np.array([0, 47/450, 0, 12/25, 32/225, 1/30, 6/25])
+        CT = np.array([0, 1/150, 0, -3/100, 16/75, 1/20, -6/25])
+        B[2][1], B[3][1], B[3][2], B[4][1], B[4][2], B[4][3], B[5][1], B[5][2], B[5][3], B[5][4], B[6][1], B[6][2], B[6][3], B[6][4], B[6][5] = 2/9, 1/12, 1/4, 69/128, -243/128, 135/64, -17/12, 27/4, -27/5, 16/15, 65/432, -5/16, 13/16, 4/27, 5/144
+
+        err_tol = 1e-6
+        level_tol = 1e-4
+        h_loc = h_start
+
+        while (True):
+            kx = np.zeros((7, self.time_steps))
+            kz = np.zeros((7, self.time_steps))
+
+            for i in range(1, 7):
+                eps_x_stage = self.eps_x.copy()
+                eps_z_stage = self.eps_z.copy()
+
+                for j in range(i):
+                    eps_x_stage += B[i][j] * kx[j]
+                    eps_z_stage += B[i][j] * kz[j]
+
+                direction_x, direction_z, fid = self.dmorph_direction(eps_x_stage, eps_z_stage)
+                if i==1:
+                    fidelity_before=fid
+                    fluence_before = self.fluence(self.eps_x, self.eps_z)
+
+                kx[i] = h_loc * direction_x
+                kz[i] = h_loc * direction_z
+            
+            TE_x = np.zeros(self.time_steps)
+            TE_z = np.zeros(self.time_steps)
+
+            for i in range(1, 7):
+                TE_x += CT[i] * kx[i]
+                TE_z += CT[i] * kz[i]
+
+            flag = True
+            max_decay_rate = 9999
+
+            for t in range(self.time_steps):
+                if abs(TE_x[t]) > err_tol:
+                    flag = False
+                    max_decay_rate = min(max_decay_rate, err_tol / abs(TE_x[t]))
+
+                if abs(TE_z[t]) > err_tol:
+                    flag = False
+                    max_decay_rate = min(max_decay_rate, err_tol / abs(TE_z[t]))
+
+            h_used = h_loc
+            h_loc = 0.9 * h_loc * max_decay_rate**(0.2)
+
+            if flag:
+                new_eps_x = self.eps_x.copy()
+                new_eps_z = self.eps_z.copy()
+
+                for i in range(1, 7):
+                    new_eps_x += CH[i] * kx[i]
+                    new_eps_z += CH[i] * kz[i]
+		
+                candidate_fidelity = self.evaluate_fidelity(new_eps_x, new_eps_z)
+                candidate_fluence = self.fluence(new_eps_x, new_eps_z)
+                level_ok = abs(candidate_fidelity - self.dmorph_level) <= level_tol
+                target_ok = candidate_fidelity >= self.dmorph_target
+                fluence_ok = candidate_fluence < fluence_before
+
+                if level_ok and fluence_ok and target_ok:
+                    self.eps_x = new_eps_x
+                    self.eps_z = new_eps_z
+                    self.last_dmorph_ds = h_used
+
+                    return candidate_fidelity, candidate_fluence, h_loc
+                else:
+                    h_loc = 0.5 * h_used
+                    continue
+
+    def optimize_dmorph(self, max_iterations=100, h_start=0.05, verbose=True):
+        fidelity_history = []
+        fluence_history = []
+        ds_history = []
+
+        h = h_start
+
+        self.dmorph_level = self.evaluate_fidelity(self.eps_x, self.eps_z)
+        self.dmorph_target = 0.99
+
+        for iteration in range(max_iterations):
+            current_fidelity, current_fluence, h = self.dmorph_rk45(h)
+
+            fidelity_history.append(current_fidelity)
+            fluence_history.append(current_fluence)
+            ds_history.append(self.last_dmorph_ds)
+
+            if verbose and (iteration % 10 == 0):
+                print(f"D-MORPH {iteration:4d} | " f"Fidelity: {current_fidelity:.6f} | " f"Fluence: {current_fluence:.6e} | " f"ds used: {self.last_dmorph_ds:.3e} | " f"next ds: {h:.3e}")
+
+        return fidelity_history, fluence_history, ds_history, self.eps_x, self.eps_z
+
+    def optimize(self, max_iterations=200, target_fidelity=0.999, verbose=True):
+        fidelity_history = []
+        ds_history = []
+
+        for iteration in range(max_iterations):
+            current_fidelity = self.rk45()
+            ds_history.append(self.last_ds)
+            fidelity_history.append(current_fidelity)
+        
+
+            if verbose and (iteration % 10 == 0):
+                print(f"Iteration {iteration:4d} | Fidelity: {current_fidelity:.6f} | ds used: {self.last_ds: .3e}| next ds: {self.ds:.3e}| ||grad_x||: {self.last_grad_x_norm:.6e} | ||grad_z||: {self.last_grad_z_norm:.6e}")
+
+            if current_fidelity >= target_fidelity:
+                if verbose:
+                    print(f"Target fidelity {target_fidelity} reached at iteration {iteration}.")
+                break
+
+        return fidelity_history, ds_history, self.eps_x, self.eps_z
