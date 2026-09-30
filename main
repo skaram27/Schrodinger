@@ -1,0 +1,216 @@
+import os
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from spinlattice import SpinLattice
+from localprop import LocalPropagator
+from trottprop import TrotterPropagator
+from optimizer import FieldOptimizer
+
+def count_magnon(state):
+    return bin(state).count("1")
+
+def get_trajectory(trott_prop, psi_i, eps_x, eps_z, time_steps):
+    psi = psi_i.copy()
+    trajectory = [psi.copy()]
+
+    for t_idx in range(time_steps):
+        psi = trott_prop.step_trotter(psi, eps_x[t_idx], eps_z[t_idx])
+        trajectory.append(psi.copy())
+
+    return np.array(trajectory)
+
+
+def state_label(state, num_sites):
+    return format(state, f"0{num_sites}b")[::-1]
+
+def main():
+    num_sites = 16
+    jxy, jz = 1.0, 1.0
+    omega = 1.0
+
+    source_site = 0
+    target_site = num_sites - 1
+
+    T = 25.0
+    time_steps = 750
+    n_substeps = 4
+    dt = T / time_steps
+
+    ds = 0.05
+    max_iterations = 1500
+    target_fidelity = 0.99
+
+    lattice = SpinLattice(num_spins=num_sites, j_xy=jxy, j_z=jz, omega=omega)
+    basis = ([0] + lattice.get_1magnon_basis() +[(1<<i)|(1<<j) for i in range(num_sites) for j in range(i+1, num_sites)])
+    #basis = lattice.get_1magnon_basis()
+    dim = len(basis)
+
+    
+    state_to_idx = {state: idx for idx, state in enumerate(basis)}
+
+    state_init_int = 0
+    state_target_int = 1 << target_site
+
+    psi_i = np.zeros(dim, dtype=complex)
+    psi_f = np.zeros(dim, dtype=complex)
+
+    psi_i[state_to_idx[state_init_int]] = 1.0
+    psi_f[state_to_idx[state_target_int]] = 1.0
+
+    local_prop = LocalPropagator(lattice=lattice, basis=basis)
+    trott_prop = TrotterPropagator(propagator=local_prop, dt=dt, n_substeps=n_substeps)
+
+    print("||mu_x|| =", np.linalg.norm(trott_prop.mu_x))
+    print("||mu_z|| =", np.linalg.norm(trott_prop.mu_z))
+
+    optimizer = FieldOptimizer(trottpropor=trott_prop, psi_i=psi_i, psi_f=psi_f, T=T, time_steps=time_steps, ds=ds)
+
+    eps_x_initial = optimizer.eps_x.copy()
+    eps_z_initial = optimizer.eps_z.copy()
+
+    print("Starting optimization run")
+    history, dshistory, eps_x_opt, eps_z_opt = optimizer.optimize(max_iterations=max_iterations, target_fidelity=target_fidelity, verbose=True)
+    eps_x_pre_dmorph = eps_x_opt.copy()
+    eps_z_pre_dmorph = eps_z_opt.copy()
+
+    print("D-MORPH Starting")
+    dmorph_fidelity_history, dmorph_fluence_history, dmorph_ds_history, eps_x_dmorph, eps_z_dmorph = optimizer.optimize_dmorph(max_iterations=50, h_start = 0.001, verbose=True)
+
+    trajectory = get_trajectory(trott_prop, psi_i, eps_x_opt, eps_z_opt, time_steps)
+
+    trajectory_time = np.linspace(0, T, time_steps + 1)
+
+    time_axis = np.arange(time_steps)*dt
+    norms = np.sum(np.abs(trajectory) ** 2, axis=1)
+
+    job_id = os.environ.get("SLURM_JOB_ID", "local")
+
+    data_filename = f"spin8_data_{job_id}.npz"
+
+    np.savez_compressed(data_filename,fidelity_history=np.array(history), eps_x_initial = eps_x_initial, eps_z_inital = eps_z_initial, eps_x=eps_x_opt,eps_z=eps_z_opt, trajectory=trajectory, basis=np.array(basis), time_axis=time_axis, trajectory_time=trajectory_time, norms=norms, final_fidelity=history[-1], num_sites=num_sites, jxy=jxy, jz=jz, omega=omega, T=T,time_steps=time_steps, n_substeps=n_substeps, dt=dt,ds=ds,max_iterations=max_iterations, target_fidelity=target_fidelity)
+
+    print(f"Saved numerical results to {data_filename}", flush=True)
+
+    fig, axes = plt.subplots(5, 2, figsize=(18, 18))
+
+    # Convergence
+    ax = axes[0, 0]
+    ax.plot(history, color="blue", lw=1.5)
+    ax.axhline(target_fidelity, color="red", linestyle="--", label=f"Target ({target_fidelity})")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Fidelity")
+    ax.set_title("Convergence History")
+    ax.grid(True)
+    ax.legend()
+
+    # Control fields
+    ax = axes[0, 1]
+    ax.plot(time_axis, eps_x_opt, label=r"$\epsilon_x(t)$", color="darkorange")
+    ax.plot(time_axis, eps_z_opt, label=r"$\epsilon_z(t)$", color="teal")
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel("Field Amplitude")
+    ax.set_title("Optimized Control Pulses")
+    ax.grid(True)
+    ax.legend()
+
+    # Norm
+    norms = np.sum(np.abs(trajectory) ** 2, axis=1)
+    ax = axes[1, 0]
+    ax.plot(trajectory_time, norms)
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel("State Norm")
+    ax.set_title("State Norm Over Time")
+    ax.grid(True)
+
+    print("Maximum norm deviation:", np.max(np.abs(norms - 1.0)))
+
+    # 0-magnon
+    indices_0 = [i for i, state in enumerate(basis) if count_magnon(state) == 0]
+    ax = axes[1, 1]
+    for i in indices_0:
+        ax.plot(trajectory_time, np.abs(trajectory[:, i]) ** 2, label=state_label(basis[i], num_sites))
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel("Population")
+    ax.set_title("0-Magnon Basis-State Population")
+    ax.grid(True)
+    ax.legend()
+
+    # 1-magnon
+    indices_1 = [i for i, state in enumerate(basis) if count_magnon(state) == 1]
+    ax = axes[2, 0]
+    for i in indices_1:
+        ax.plot(trajectory_time, np.abs(trajectory[:, i]) ** 2, label=state_label(basis[i], num_sites))
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel("Population")
+    ax.set_title("1-Magnon Basis-State Populations")
+    ax.grid(True)
+    ax.legend(fontsize=7)
+
+    # 2-magnon
+    indices_2 = [i for i, state in enumerate(basis) if count_magnon(state) == 2]
+    ax = axes[2, 1]
+    for i in indices_2:
+        ax.plot(trajectory_time, np.abs(trajectory[:, i]) ** 2, label=state_label(basis[i], num_sites))
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel("Population")
+    ax.set_title("2-Magnon Basis-State Populations")
+    ax.grid(True)
+    ax.legend(fontsize=6)
+
+    # Total population by magnon sector
+    ax = axes[3, 0]
+    for magnon_number in [0, 1, 2]:
+        indices = [i for i, state in enumerate(basis) if count_magnon(state) == magnon_number]
+        total_population = np.sum(np.abs(trajectory[:, indices]) ** 2, axis=1)
+        ax.plot(trajectory_time, total_population, label=f"$S_{magnon_number}$")
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel("Total Population")
+    ax.set_title("Population by Magnon Sector")
+    ax.grid(True)
+    ax.legend()
+
+    # Intial Control Fields
+    ax = axes[3, 1]
+    ax.plot(time_axis, eps_x_initial, label=r"$\epsilon_x(t)$", color="darkorange")
+    ax.plot(time_axis, eps_z_initial, label=r"$\epsilon_z(t)$", color="teal")
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel("Field Amplitude")
+    ax.set_title("Initial Control Pulses")
+    ax.grid(True)
+    ax.legend()
+
+    #DMORPH x-field
+    ax = axes[4, 0]
+    ax.plot(time_axis, eps_x_opt, label="Optimized")
+    ax.plot(time_axis, eps_x_dmorph, label="D-MORPH")
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel(r"$\epsilon_x(t)$")
+    ax.set_title("x-Control Comparison")
+    ax.grid(True)
+    ax.legend()
+
+    #DMORPH z-field
+    ax = axes[4, 1]
+    ax.plot(time_axis, eps_z_opt, label="Optimized")
+    ax.plot(time_axis, eps_z_dmorph, label="D-MORPH")
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel(r"$\epsilon_z(t)$")
+    ax.set_title("z-Control Comparison")
+    ax.grid(True)
+    ax.legend()
+
+    plt.tight_layout()
+    #plt.show()
+    figure_filename = f"spin8_results_{job_id}.png"
+    plt.savefig(figure_filename, dpi=200, bbox_inches="tight")
+    plt.close()
+
+    print(f"Saved figure to {figure_filename}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+
