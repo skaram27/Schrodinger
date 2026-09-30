@@ -1,0 +1,87 @@
+import numpy as np
+
+class SpinLattice:
+    def __init__(self, num_spins=16, j_xy=1.0, j_z=1.0, omega=1.0):
+        self.num_spins = num_spins
+        self.j_xy = j_xy
+        self.j_z = j_z 
+        self.omega = omega
+
+        self.bonds = [(i, i + 1) for i in range(num_spins - 1)]
+        self.num_terms = len(self.bonds)
+
+    def get_1magnon_basis(self):
+        return [1 << i for i in range(self.num_spins)]
+
+    def get_bit(self, state, site):
+        return (state >> site) & 1
+
+    def flip_bit(self, state, site):
+        return state ^ (1 << site)
+
+    def bond_matrix_element(self, bra_state, ket_state, bond_index):
+        j, k = self.bonds[bond_index]
+        val = 0.0 + 0.0j
+
+        jbit = self.get_bit(ket_state, j)
+        kbit = self.get_bit(ket_state, k)
+
+        if bra_state == ket_state:
+            sz_j = 1.0 if jbit == 1 else -1.0
+            sz_k = 1.0 if kbit == 1 else -1.0
+            val = self.j_z * sz_j * sz_k
+
+        if jbit != kbit:
+            flipped = self.flip_bit(self.flip_bit(ket_state, j), k)
+            if bra_state == flipped:
+                val += 2.0 * self.j_xy
+
+        return val 
+
+    def onsite_matrix_element(self, bra_state, ket_state, bond_index):
+        if bra_state != ket_state:
+            return 0.0 + 0.0j
+
+        bit = self.get_bit(ket_state, bond_index)
+
+        if bit == 1:
+            sz = 1.0
+        else:
+            sz = -1.0
+
+        return self.omega * sz
+
+    def control_matrix_element(self, bra_state, ket_state, site, pauli_type):
+        val = 0.0 + 0.0j
+        bit = self.get_bit(ket_state, site)
+
+        if pauli_type.lower() == 'z':
+            if bra_state == ket_state:
+                if bit ==1:
+                    sz=1.0
+                else:
+                    sz=-1.0
+                val = sz + 0.0j
+        elif pauli_type.lower() == 'x':
+            flipped = self.flip_bit(ket_state, site)
+            if bra_state == flipped:
+                val = 1.0 + 0.0j
+
+        return val 
+
+    def get_connected_states(self, ket_state, site=0):
+        connected = set()
+        connected.add(ket_state)
+
+        for j, k in self.bonds:
+            jbit = self.get_bit(ket_state, j)
+            kbit = self.get_bit(ket_state, k)
+
+            if jbit != kbit:
+                next_state = self.flip_bit(self.flip_bit(ket_state, j), k)
+                connected.add(next_state)
+
+        driven = self.flip_bit(ket_state, site)
+        connected.add(driven)
+
+        return list(connected)
