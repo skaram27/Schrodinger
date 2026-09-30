@@ -1,0 +1,60 @@
+import numpy as np
+
+class LocalPropagator:
+    def __init__(self, lattice, basis):
+        self.lattice = lattice
+        self.basis = list(basis)
+        self.dim = len(self.basis)
+        self.stateindexconnect = {state: i for i, state in enumerate(self.basis)}
+
+    def staticH(self, bondnum):
+        h_static = np.zeros((self.dim, self.dim), dtype=complex)
+
+        for column, ket_state in enumerate(self.basis):
+            for row, bra_state in enumerate(self.basis):
+                value = self.lattice.bond_matrix_element(bra_state, ket_state, bondnum)
+                if value != 0.0:
+                    h_static[row, column] = value
+
+        return h_static
+
+    def onsiteH(self, site):
+        h_onsite = np.zeros((self.dim, self.dim), dtype=complex)
+
+        for column, ket_state in enumerate(self.basis):
+            for row, bra_state in enumerate(self.basis):
+                value = self.lattice.onsite_matrix_element(bra_state, ket_state, site)
+                if value != 0.0:
+                    h_onsite[row, column] = value
+
+        return h_onsite
+
+    def controlH(self, site=0, pauli_type='x'):
+        h_control = np.zeros((self.dim, self.dim), dtype=complex)
+
+        for column, ket_state in enumerate(self.basis):
+            for row, bra_state in enumerate(self.basis):
+                value = self.lattice.control_matrix_element(bra_state, ket_state, site, pauli_type)
+                if value != 0.0:
+                    h_control[row, column] = value
+
+        return h_control
+
+    def H0(self):
+        h_0 = np.zeros((self.dim, self.dim), dtype=complex)
+
+        for bondnum in range(self.lattice.num_terms):
+            h_0 += self.staticH(bondnum)
+
+        for bondnum in range(self.lattice.num_spins): 
+            h_0 += self.onsiteH(bondnum)
+        return h_0
+
+    def local_staticH(self):
+        return [self.onsiteH(b) for b in range(self.lattice.num_spins)] + [self.staticH(b) for b in range(self.lattice.num_terms)]
+
+    def total_H(self, eps_x, eps_z, site=0):
+        h_0 = self.H0()
+        mu_x = self.controlH(site=site, pauli_type='x')
+        mu_z = self.controlH(site=site, pauli_type='z')
+        return h_0 + eps_x * mu_x + eps_z * mu_z
