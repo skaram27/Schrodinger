@@ -1,0 +1,557 @@
+import os
+import numpy as np
+import scipy.linalg as la
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+def get_bit(state, site):
+    return (state >> site) & 1
+
+def flip_bit(state, site):
+    return state ^ (1 << site)
+
+def count_magnon(state):
+    return bin(state).count("1")
+
+def state_label(state, num_sites):
+    return format(state, f"0{num_sites}b")[::-1]
+
+def build_basis(num_sites):
+    return [0] + [1 << i for i in range(num_sites)] + [(1 << i) | (1 << j) for i in range(num_sites) for j in range(i + 1, num_sites)]
+
+Z = np.array([[-1,0], [0,1]], dtype=complex)
+X = np.array([[0,1], [1,0]], dtype=complex)
+
+def onsite_hamiltonian(omega=1):
+    return omega * Z
+
+def bond_hamiltonian(jxy=1, jz=1):
+    return np.array([[jz, 0, 0, 0], [0, -jz, 2*jxy, 0], [0, 2*jxy, -jz, 0], [0, 0, 0, jz]], dtype=complex)
+
+def build_static_unitaries(basis, num_sites, dr, omega=1, jxy=1, jz=1):
+    onsite_eigens = np.array([omega *(2*count_magnon(state)-num_sites) for state in basis])
+    onsite_half = np.exp(-1.0j*onsite_eigens*(dr/2))
+    onsite_half_dag = onsite_half.conj()
+
+    bond_half = la.expm(-1.0j * bond_hamiltonian(jxy, jz) * (dr / 2.0))
+    bond_half_dag = bond_half.conj().T
+
+    return onsite_half, bond_half, onsite_half_dag, bond_half_dag
+
+def build_state_index(basis):
+    return {state: idx for idx, state in enumerate(basis)}
+
+def build_bond_maps(basis,state_to_idx,num_sites):
+    bond_maps = []
+    for site in range(num_sites-1):
+        aligned = []
+        pairs = []
+        for index,state in enumerate(basis):
+            bit1 = get_bit(state,site)
+            bit2 = get_bit(state,site+1)
+            if bit1==bit2:
+                aligned.append(index)
+            elif bit1==1 and bit2==0:
+                swapped = flip_bit(flip_bit(state,site),site+1)
+                pairs.append((index,state_to_idx[swapped]))
+        bond_maps.append((np.array(aligned,dtype=int),np.array(pairs,dtype=int)))
+    return bond_maps
+
+def apply_bond_half(psi, bond_map, bond_half):
+    new_psi = psi.copy()
+    aligned, pairs = bond_map
+    aligned_phase = bond_half[0,0]
+    pair_unitary = bond_half[1:3,1:3]
+    new_psi[aligned] = aligned_phase*psi[aligned]
+
+    if len(pairs)>0:
+        local_psi = np.vstack((psi[pairs[:,0]],psi[pairs[:,1]]))
+        new_local_psi = pair_unitary@local_psi
+        new_psi[pairs[:,0]] = new_local_psi[0]
+        new_psi[pairs[:,1]] = new_local_psi[1]
+    return new_psi
+
+
+def get_connected_states(state, num_sites, site=0):
+    connected = set()
+    connected.add(state)
+
+    for j in range(num_sites-1):
+        jbit = get_bit(state,j)
+        kbit = get_bit(state, j+1)
+        if jbit !=kbit:
+            connect = flip_bit(flip_bit(state, j), j+1)
+            connected.add(connect)
+    driven = flip_bit(state, site)
+    connected.add(driven)
+    return list(connected)
+
+def apply_onsite_half(psi, onsite_half):
+    return onsite_half * psi
+
+def control_unitary(eps_x, eps_z, dr):
+    lamb = np.sqrt(eps_x**2 + eps_z**2)
+    if lamb == 0:
+        return np.eye(2, dtype=complex)
+    h_ctrl = eps_x*X + eps_z*Z
+    return np.cos(lamb*dr)*np.eye(2, dtype=complex) + (-1.0j*np.sin(lamb*dr)/lamb)*h_ctrl
+
+def apply_control(psi, basis, state_to_idx, eps_x, eps_z, dr, site=0):
+    new_psi = psi.copy()
+    u_ctrl = control_unitary(eps_x, eps_z, dr)
+    for index, state in enumerate(basis):
+        bit = get_bit(state,site)
+        partner = flip_bit(state,site)
+
+        if partner in state_to_idx:
+            if bit==0:
+                partner_idx = state_to_idx[partner]
+                local_psi = np.array([psi[index], psi[partner_idx]])
+                new_local_psi = u_ctrl@local_psi
+                new_psi[index]=new_local_psi[0]
+                new_psi[partner_idx]=new_local_psi[1]
+        else:
+            z_eigen = -1 if bit==0 else 1
+            new_psi[index] = np.exp(-1.0j*eps_z*z_eigen*dr)*psi[index]  
+    return new_psi
+
+def trottprop(psi, basis, state_to_idx, bond_maps, num_sites, onsite_half, bond_half, eps_x, eps_z, dr):
+    state = apply_onsite_half(psi, onsite_half)
+    for i in range(num_sites-1):
+        state = apply_bond_half(state, bond_maps[i], bond_half)
+
+    state = apply_control(state, basis, state_to_idx, eps_x, eps_z, dr)
+
+    for i in reversed(range(num_sites-1)):
+        state = apply_bond_half(state, bond_maps[i], bond_half)
+
+    state = apply_onsite_half(state, onsite_half)
+
+    return state
+
+def fulltrottstep(psi, basis, state_to_idx, bond_maps, num_sites, onsite_half, bond_half, eps_x, eps_z, dr, substeps):
+    state = psi.copy()
+    for i in range(substeps):
+        state = trottprop(state, basis, state_to_idx, bond_maps, num_sites, onsite_half, bond_half, eps_x, eps_z, dr)
+    return state
+
+def forwardprop(psi_init, basis, state_to_idx, bond_maps, num_sites, onsite_half, bond_half, eps_x_T, eps_z_T, dr, substeps):
+    state_history = [psi_init.copy()]
+    state = psi_init.copy()
+    for i in range(len(eps_x_T)):
+        state = fulltrottstep(state, basis, state_to_idx, bond_maps, num_sites, onsite_half, bond_half, eps_x_T[i], eps_z_T[i], dr, substeps)
+        state_history.append(state.copy())
+    return state_history
+
+def backtrottprop(psi, basis, state_to_idx, bond_maps, num_sites, onsite_half_dag, bond_half_dag, eps_x, eps_z, dr):
+    state = apply_onsite_half(psi, onsite_half_dag)
+    for i in range(num_sites-1):
+        state = apply_bond_half(state, bond_maps[i], bond_half_dag)
+
+    state = apply_control(state, basis, state_to_idx, eps_x, eps_z, -dr)
+
+    for i in reversed(range(num_sites-1)):
+        state = apply_bond_half(state, bond_maps[i], bond_half_dag)
+
+    state = apply_onsite_half(state, onsite_half_dag)
+
+    return state
+
+def backtrottstep(psi, basis, state_to_idx, bond_maps, num_sites, onsite_half_dag, bond_half_dag, eps_x, eps_z, dr, substeps):
+    state = psi.copy()
+    for i in range(substeps):
+        state = backtrottprop(state, basis, state_to_idx, bond_maps, num_sites, onsite_half_dag, bond_half_dag, eps_x, eps_z, dr)
+    return state
+
+def backwardprop(psi_target, basis, state_to_idx, bond_maps, num_sites, onsite_half_dag, bond_half_dag, eps_x_T, eps_z_T, dr, substeps):
+    chi_history = [None]*(len(eps_x_T)+1)
+    state = psi_target.copy()
+    chi_history[-1] = state.copy()
+    for i in reversed(range(len(eps_x_T))):
+        state = backtrottstep(state, basis, state_to_idx, bond_maps, num_sites, onsite_half_dag, bond_half_dag, eps_x_T[i], eps_z_T[i], dr, substeps)
+        chi_history[i] = state.copy()
+    return chi_history
+
+
+def apply_x(psi, basis, state_to_idx, site=0):
+    new_psi = np.zeros_like(psi)
+    for index, state in enumerate(basis):
+        partner = flip_bit(state,site)
+        if partner in state_to_idx:
+            partner_idx = state_to_idx[partner]
+            new_psi[partner_idx] += psi[index]
+    return new_psi
+
+def apply_z(psi, basis, site=0):
+    new_psi = psi.copy()
+    for index, state in enumerate(basis):
+        z_eigen = -1 if get_bit(state,site)==0 else 1
+        new_psi[index] = z_eigen*psi[index]
+    return new_psi
+
+def compute_gradient(psi_init, psi_target, basis, state_to_idx, bond_maps, num_sites, onsite_half, bond_half, onsite_half_dag, bond_half_dag, eps_x_T, eps_z_T, dr, substeps):
+    state_history = forwardprop(psi_init, basis, state_to_idx, bond_maps, num_sites, onsite_half, bond_half, eps_x_T, eps_z_T, dr, substeps)
+    chi_history = backwardprop(psi_target, basis, state_to_idx, bond_maps, num_sites, onsite_half_dag, bond_half_dag, eps_x_T, eps_z_T, dr, substeps)
+    overlap = np.vdot(psi_target,state_history[-1])
+    grad_x = np.zeros(len(eps_x_T))
+    grad_z = np.zeros(len(eps_z_T))
+    for i in range(len(eps_x_T)):
+        psi_t = state_history[i+1]
+        chi_t = chi_history[i+1]
+        x_psi = apply_x(psi_t,basis,state_to_idx)
+        z_psi = apply_z(psi_t,basis)
+        mat_elem_x = np.vdot(chi_t,x_psi)
+        mat_elem_z = np.vdot(chi_t,z_psi)
+        grad_x[i] = 2.0*np.imag(np.conj(overlap)*mat_elem_x)
+        grad_z[i] = 2.0*np.imag(np.conj(overlap)*mat_elem_z)
+    fidelity = float(np.abs(overlap)**2)
+    return grad_x, grad_z, fidelity
+
+def rk45_step(eps_x_T, eps_z_T, h_start, direction_func, err_tol=1e-6):
+    B = np.zeros((7,7))
+    CH = np.array([0,47/450,0,12/25,32/225,1/30,6/25])
+    CT = np.array([0,1/150,0,-3/100,16/75,1/20,-6/25])
+    B[2][1],B[3][1],B[3][2],B[4][1],B[4][2],B[4][3],B[5][1],B[5][2],B[5][3],B[5][4],B[6][1],B[6][2],B[6][3],B[6][4],B[6][5] = 2/9,1/12,1/4,69/128,-243/128,135/64,-17/12,27/4,-27/5,16/15,65/432,-5/16,13/16,4/27,5/144
+    h_loc = h_start
+    while True:
+        kx = np.zeros((7,len(eps_x_T)))
+        kz = np.zeros((7,len(eps_z_T)))
+        for i in range(1,7):
+            eps_x_stage = eps_x_T.copy()
+            eps_z_stage = eps_z_T.copy()
+            for j in range(i):
+                eps_x_stage += B[i][j]*kx[j]
+                eps_z_stage += B[i][j]*kz[j]
+            direction_x,direction_z = direction_func(eps_x_stage,eps_z_stage)
+            kx[i] = h_loc*direction_x
+            kz[i] = h_loc*direction_z
+        TE_x = np.zeros(len(eps_x_T))
+        TE_z = np.zeros(len(eps_z_T))
+        for i in range(1,7):
+            TE_x += CT[i]*kx[i]
+            TE_z += CT[i]*kz[i]
+        flag = True
+        max_decay_rate = 9999
+        for t in range(len(eps_x_T)):
+            if abs(TE_x[t])>err_tol:
+                flag = False
+                max_decay_rate = min(max_decay_rate,err_tol/abs(TE_x[t]))
+            if abs(TE_z[t])>err_tol:
+                flag = False
+                max_decay_rate = min(max_decay_rate,err_tol/abs(TE_z[t]))
+        h_used = h_loc
+        h_loc = 0.9*h_loc*max_decay_rate**0.2
+        if flag:
+            new_eps_x = eps_x_T.copy()
+            new_eps_z = eps_z_T.copy()
+            for i in range(1,7):
+                new_eps_x += CH[i]*kx[i]
+                new_eps_z += CH[i]*kz[i]
+            return new_eps_x,new_eps_z,h_used,h_loc
+
+
+def fidelity(psi_target, state):
+    return float(np.abs(np.vdot(psi_target, state))**2)
+
+def evaluate_fidelity(psi_init, psi_target, basis, state_to_idx, bond_maps, num_sites, onsite_half, bond_half, eps_x_T, eps_z_T, dr, substeps):
+    state = psi_init.copy()
+    for i in range(len(eps_x_T)):
+        state = fulltrottstep(state, basis, state_to_idx, bond_maps, num_sites,onsite_half,bond_half,eps_x_T[i],eps_z_T[i],dr,substeps)
+    return fidelity(psi_target,state)
+
+def optimize(psi_init, psi_target, basis, state_to_idx, bond_maps, num_sites, onsite_half, bond_half, onsite_half_dag, bond_half_dag, eps_x_T, eps_z_T, dr, substeps, ds, max_iterations, target_fidelity, verbose=True):
+    fidelity_history = []
+    ds_history = []
+    h = ds
+    for iteration in range(max_iterations):
+        def direction_func(eps_x_stage,eps_z_stage):
+            grad_x,grad_z,_ = compute_gradient(psi_init, psi_target, basis, state_to_idx, bond_maps, num_sites, onsite_half, bond_half, onsite_half_dag, bond_half_dag, eps_x_stage,eps_z_stage,dr,substeps)
+            return grad_x,grad_z
+        eps_x_T,eps_z_T,h_used,h = rk45_step(eps_x_T,eps_z_T,h,direction_func)
+        current_fidelity = evaluate_fidelity(psi_init,psi_target, basis, state_to_idx, bond_maps, num_sites, onsite_half, bond_half, eps_x_T, eps_z_T, dr, substeps)
+        fidelity_history.append(current_fidelity)
+        ds_history.append(h_used)
+        if verbose and iteration%10==0:
+            print(f"Iteration {iteration:4d} | Fidelity: {current_fidelity:.6f} | ds used: {h_used:.3e} | next ds: {h:.3e}")
+        if current_fidelity>=target_fidelity:
+            if verbose:
+                print(f"Target fidelity {target_fidelity} reached at iteration {iteration}.")
+            break
+    return fidelity_history,ds_history,eps_x_T,eps_z_T
+
+def fluence(eps_x_T,eps_z_T,dt):
+    return dt*np.sum(eps_x_T**2+eps_z_T**2)
+
+def dmorph_direction(eps_x_T,eps_z_T,grad_x,grad_z):
+    f_x = -eps_x_T
+    f_z = -eps_z_T
+
+    numerator = np.dot(grad_x,f_x)+np.dot(grad_z,f_z)
+    denominator = np.dot(grad_x,grad_x)+np.dot(grad_z,grad_z)
+
+    if denominator<1e-14:
+        return f_x,f_z
+
+    coeff = numerator/denominator
+    direction_x = f_x-coeff*grad_x
+    direction_z = f_z-coeff*grad_z
+
+    return direction_x,direction_z
+
+def dmorph_target_fluence(psi_init,psi_target,basis,state_to_idx,bond_maps,num_sites,onsite_half,bond_half,onsite_half_dag,bond_half_dag,eps_x_T,eps_z_T,dr,substeps,dt,ds,max_iterations,target_fidelity,target_fluence_ratio,level_tol=1e-4,verbose=True):
+    initial_fluence = fluence(eps_x_T,eps_z_T,dt)
+    target_fluence = target_fluence_ratio*initial_fluence
+    dmorph_level = evaluate_fidelity(psi_init,psi_target,basis,state_to_idx,bond_maps,num_sites,onsite_half,bond_half,eps_x_T,eps_z_T,dr,substeps)
+    fidelity_history = [dmorph_level]
+    fluence_history = [initial_fluence]
+    ds_history = []
+    h = ds
+
+    if verbose:
+        print(f"D-MORPH starting fluence: {initial_fluence:.6f} | target fluence: {target_fluence:.6f}")
+    for iteration in range(max_iterations):
+        if fluence(eps_x_T,eps_z_T,dt)<=target_fluence:
+            if verbose:
+                print(f"D-MORPH target fluence reached at iteration {iteration}.")
+            break
+        def direction_func(eps_x_stage,eps_z_stage):
+            grad_x,grad_z,_ = compute_gradient(psi_init,psi_target,basis,state_to_idx,bond_maps,num_sites,onsite_half,bond_half,onsite_half_dag,bond_half_dag,eps_x_stage,eps_z_stage,dr,substeps)
+            return dmorph_direction(eps_x_stage,eps_z_stage,grad_x,grad_z)
+
+        old_fluence = fluence(eps_x_T,eps_z_T,dt)
+        new_eps_x,new_eps_z,h_used,h_next = rk45_step(eps_x_T,eps_z_T,h,direction_func)
+        new_fidelity = evaluate_fidelity(psi_init,psi_target,basis,state_to_idx,bond_maps,num_sites,onsite_half,bond_half,new_eps_x,new_eps_z,dr,substeps)
+        new_fluence = fluence(new_eps_x,new_eps_z,dt)
+
+        level_ok = abs(new_fidelity-dmorph_level)<=level_tol
+        target_ok = new_fidelity>=target_fidelity
+        fluence_ok = new_fluence<old_fluence
+
+        if level_ok and target_ok and fluence_ok:
+            eps_x_T = new_eps_x
+            eps_z_T = new_eps_z
+
+            h = h_next
+            fidelity_history.append(new_fidelity)
+            fluence_history.append(new_fluence)
+            ds_history.append(h_used)
+            if verbose:
+                print(f"D-MORPH {iteration:4d} | Fidelity: {new_fidelity:.6f} | Fluence: {new_fluence:.6f} | Ratio: {new_fluence/initial_fluence:.4f} | ds used: {h_used:.3e} | next ds: {h:.3e}")
+        else:
+            h = h_used/2
+            if verbose:
+                print(f"D-MORPH {iteration:4d} rejected | Fidelity: {new_fidelity:.6f} | Fluence: {new_fluence:.6f} | next ds: {h:.3e}")
+    if fluence(eps_x_T,eps_z_T,dt)>target_fluence:
+        if verbose:
+            print(f"D-MORPH stopped at maximum of {max_iterations} iterations before reaching target fluence.")
+    return fidelity_history,fluence_history,ds_history,eps_x_T,eps_z_T
+
+def main():
+    num_sites = 16
+
+    jxy = 1.0
+    jz = 1.0
+    omega = 1.0
+
+    target_site = num_sites-1
+
+    T = 25.0
+    time_steps = 750
+    n_substeps = 4
+
+    dt = T / time_steps
+    dr = dt / n_substeps
+
+    ds = 0.05
+    max_iterations = 100
+    target_fidelity = 0.99
+
+    dmorph_target_fluence_ratio = 0.90
+    dmorph_max_iterations = 100
+    dmorph_ds = 0.001
+    dmorph_level_tol = 1e-4
+
+
+    basis = build_basis(num_sites)
+    dim = len(basis)
+    state_to_idx = build_state_index(basis)
+    bond_maps = build_bond_maps(basis, state_to_idx, num_sites)
+    onsite_half, bond_half, onsite_half_dag, bond_half_dag = build_static_unitaries(basis, num_sites, dr, omega, jxy, jz)
+    
+    state_init = 0 
+    state_target = 1 << target_site
+
+    psi_init = np.zeros(dim,dtype=complex)
+    psi_target = np.zeros(dim,dtype=complex)
+    psi_init[state_to_idx[state_init]] = 1.0
+    psi_target[state_to_idx[state_target]] = 1.0
+
+    time_axis = np.arange(time_steps)*dt
+    eps_x_T = 0.02*(np.sin(0.5*time_axis)+np.sin(1.1*time_axis+0.4)+np.sin(1.9*time_axis+1.0))
+    eps_z_T = 0.15*(np.sin(0.7*time_axis+0.2)+np.sin(1.4*time_axis+0.8)+np.sin(2.3*time_axis+1.3))
+    eps_x_initial = eps_x_T.copy()
+    eps_z_initial = eps_z_T.copy()
+    print("Initial fidelity:",evaluate_fidelity(psi_init, psi_target, basis, state_to_idx, bond_maps, num_sites, onsite_half, bond_half, eps_x_T, eps_z_T, dr, n_substeps))
+    print("Starting optimization run")
+    history,dshistory,eps_x_opt,eps_z_opt = optimize(psi_init, psi_target, basis, state_to_idx, bond_maps, num_sites, onsite_half, bond_half, onsite_half_dag, bond_half_dag, eps_x_T, eps_z_T, dr, n_substeps, ds, max_iterations, target_fidelity, verbose=True)
+
+    eps_x_pre_dmorph = eps_x_opt.copy()
+    eps_z_pre_dmorph = eps_z_opt.copy()
+    qoc_final_fidelity = history[-1]
+
+    if qoc_final_fidelity>=target_fidelity:
+        print("D-MORPH Starting")
+        dmorph_fidelity_history,dmorph_fluence_history,dmorph_ds_history,eps_x_dmorph,eps_z_dmorph = dmorph_target_fluence(psi_init,psi_target,basis,state_to_idx,bond_maps,num_sites,onsite_half,bond_half,onsite_half_dag,bond_half_dag,eps_x_pre_dmorph,eps_z_pre_dmorph,dr,n_substeps,dt,dmorph_ds,dmorph_max_iterations,target_fidelity,dmorph_target_fluence_ratio,dmorph_level_tol,verbose=True)
+    else:
+        print("QOCT did not reach target fidelity, so D-MORPH was skipped.")
+        dmorph_fidelity_history = [qoc_final_fidelity]
+        dmorph_fluence_history = [fluence(eps_x_pre_dmorph,eps_z_pre_dmorph,dt)]
+        dmorph_ds_history = []
+        eps_x_dmorph = eps_x_pre_dmorph.copy()
+        eps_z_dmorph = eps_z_pre_dmorph.copy()
+
+    final_fidelity = evaluate_fidelity(psi_init,psi_target,basis,state_to_idx,bond_maps,num_sites,onsite_half,bond_half,eps_x_dmorph,eps_z_dmorph,dr,n_substeps)
+    initial_dmorph_fluence = fluence(eps_x_pre_dmorph,eps_z_pre_dmorph,dt)
+    final_fluence = fluence(eps_x_dmorph,eps_z_dmorph,dt)
+    print("Final fidelity:",final_fidelity)
+    print("Fluence before D-MORPH:",initial_dmorph_fluence)
+    print("Fluence after D-MORPH:",final_fluence)
+
+    trajectory = np.array(forwardprop(psi_init,basis,state_to_idx,bond_maps,num_sites,onsite_half,bond_half,eps_x_dmorph,eps_z_dmorph,dr,n_substeps))
+    trajectory_time = np.linspace(0,T,time_steps+1)
+    norms = np.sum(np.abs(trajectory)**2,axis=1)
+
+    job_id = os.environ.get("SLURM_JOB_ID","local")
+    data_filename = f"spin{num_sites}_data_{job_id}.npz"
+    np.savez_compressed(data_filename,fidelity_history=np.array(history),ds_history=np.array(dshistory),dmorph_fidelity_history=np.array(dmorph_fidelity_history),dmorph_fluence_history=np.array(dmorph_fluence_history),dmorph_ds_history=np.array(dmorph_ds_history),eps_x_initial=eps_x_initial,eps_z_initial=eps_z_initial,eps_x_pre_dmorph=eps_x_pre_dmorph,eps_z_pre_dmorph=eps_z_pre_dmorph,eps_x_final=eps_x_dmorph,eps_z_final=eps_z_dmorph,trajectory=trajectory,basis=np.array(basis),time_axis=time_axis,trajectory_time=trajectory_time,norms=norms,qoc_final_fidelity=qoc_final_fidelity,final_fidelity=final_fidelity,initial_dmorph_fluence=initial_dmorph_fluence,final_fluence=final_fluence,num_sites=num_sites,jxy=jxy,jz=jz,omega=omega,T=T,time_steps=time_steps,n_substeps=n_substeps,dt=dt,ds=ds,max_iterations=max_iterations,target_fidelity=target_fidelity,dmorph_target_fluence_ratio=dmorph_target_fluence_ratio,dmorph_max_iterations=dmorph_max_iterations,dmorph_ds=dmorph_ds,dmorph_level_tol=dmorph_level_tol)
+    print(f"Saved numerical results to {data_filename}",flush=True)
+
+
+    fig,axes = plt.subplots(6,2,figsize=(18,21))
+
+    # fidelity
+    ax = axes[0,0]
+    ax.plot(history,color="blue",lw=1.5)
+    ax.axhline(target_fidelity,color="red",linestyle="--",label=f"Target ({target_fidelity})")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Fidelity")
+    ax.set_title("Convergence History")
+    ax.grid(True)
+    ax.legend()
+
+    # control fields
+    ax = axes[0,1]
+    ax.plot(time_axis,eps_x_pre_dmorph,label=r"$\epsilon_x(t)$",color="darkorange")
+    ax.plot(time_axis,eps_z_pre_dmorph,label=r"$\epsilon_z(t)$",color="teal")
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel("Field Amplitude")
+    ax.set_title("Optimized Control Pulses")
+    ax.grid(True)
+    ax.legend()
+
+    # state norm
+    ax = axes[1,0]
+    ax.plot(trajectory_time,norms)
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel("State Norm")
+    ax.set_title("State Norm Over Time")
+    ax.grid(True)
+    print("Maximum norm deviation:",np.max(np.abs(norms-1.0)))
+
+    # 0-magnon
+    indices_0 = [i for i,state in enumerate(basis) if count_magnon(state)==0]
+    ax = axes[1,1]
+    for i in indices_0:
+        ax.plot(trajectory_time,np.abs(trajectory[:,i])**2,label=state_label(basis[i],num_sites))
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel("Population")
+    ax.set_title("0-Magnon Basis-State Population")
+    ax.grid(True)
+    ax.legend()
+
+    # 1-magnon 
+    indices_1 = [i for i,state in enumerate(basis) if count_magnon(state)==1]
+    ax = axes[2,0]
+    for i in indices_1:
+        ax.plot(trajectory_time,np.abs(trajectory[:,i])**2,label=state_label(basis[i],num_sites))
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel("Population")
+    ax.set_title("1-Magnon Basis-State Populations")
+    ax.grid(True)
+    ax.legend(fontsize=7)
+
+    # 2-magnon 
+    indices_2 = [i for i,state in enumerate(basis) if count_magnon(state)==2]
+    ax = axes[2,1]
+    for i in indices_2:
+        ax.plot(trajectory_time,np.abs(trajectory[:,i])**2,label=state_label(basis[i],num_sites))
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel("Population")
+    ax.set_title("2-Magnon Basis-State Populations")
+    ax.grid(True)
+    ax.legend(fontsize=6)
+
+    # all magnon 
+    ax = axes[3,0]
+    for magnon_number in [0,1,2]:
+        indices = [i for i,state in enumerate(basis) if count_magnon(state)==magnon_number]
+        total_population = np.sum(np.abs(trajectory[:,indices])**2,axis=1)
+        ax.plot(trajectory_time,total_population,label=f"$S_{magnon_number}$")
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel("Total Population")
+    ax.set_title("Population by Magnon Sector")
+    ax.grid(True)
+    ax.legend()
+
+    # initial control fields
+    ax = axes[3,1]
+    ax.plot(time_axis,eps_x_initial,label=r"$\epsilon_x(t)$",color="darkorange")
+    ax.plot(time_axis,eps_z_initial,label=r"$\epsilon_z(t)$",color="teal")
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel("Field Amplitude")
+    ax.set_title("Initial Control Pulses")
+    ax.grid(True)
+    ax.legend()
+
+    # x-control field before and after D-MORPH
+    ax = axes[4,0]
+    ax.plot(time_axis,eps_x_pre_dmorph,label="Optimized")
+    ax.plot(time_axis,eps_x_dmorph,label="D-MORPH")
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel(r"$\epsilon_x(t)$")
+    ax.set_title("x-Control Comparison")
+    ax.grid(True)
+    ax.legend()
+
+    # z-control field before and after D-MORPH
+    ax = axes[4,1]
+    ax.plot(time_axis,eps_z_pre_dmorph,label="Optimized")
+    ax.plot(time_axis,eps_z_dmorph,label="D-MORPH")
+    ax.set_xlabel("Time $t$")
+    ax.set_ylabel(r"$\epsilon_z(t)$")
+    ax.set_title("z-Control Comparison")
+    ax.grid(True)
+    ax.legend()
+
+    # fluence 
+    ax = axes[5,0]
+    ax.plot(dmorph_fluence_history)
+    ax.axhline(dmorph_target_fluence_ratio*initial_dmorph_fluence,color="red",linestyle="--",label=f"Target ({100*dmorph_target_fluence_ratio:.1f}%)")
+    ax.set_xlabel("Accepted D-MORPH Step")
+    ax.set_ylabel("Fluence")
+    ax.set_title("Fluence History")
+    ax.grid(True)
+    ax.legend()
+
+    axes[5,1].axis("off")
+
+    plt.tight_layout()
+    figure_filename = f"spin{num_sites}_results_{job_id}.png"
+    plt.savefig(figure_filename,dpi=200,bbox_inches="tight")
+    plt.close()
+    print(f"Saved figure to {figure_filename}",flush=True)
+
+if __name__ == "__main__":
+    main()
+
