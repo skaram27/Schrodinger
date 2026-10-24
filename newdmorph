@@ -1,0 +1,74 @@
+def dmorph_final(psi_init,psi_target,basis,state_to_idx,bond_maps,num_sites,onsite_half,bond_half,onsite_half_dag,bond_half_dag,eps_x_T,eps_z_T,dr,substeps,dt,ds,max_iterations,target_fidelity,no_change_iterations,fluence_tolerance,verbose=True):
+    initial_fluence = fluence(eps_x_T,eps_z_T,dt)
+    dmorph_level = evaluate_fidelity(psi_init,psi_target,basis,state_to_idx,bond_maps,num_sites,onsite_half,bond_half,eps_x_T,eps_z_T,dr,substeps)
+    best_fluence = initial_fluence
+    best_eps_x = eps_x_T.copy()
+    best_eps_z = eps_z_T.copy()
+    fidelity_history = [dmorph_level]
+    fluence_history = [initial_fluence]
+    ds_history = []
+    h = ds
+    counter = 0
+    print(f"D-MORPH starting fluence: {initial_fluence:.6f} | starting fidelity: {dmorph_level:.6f}")
+    for iter in range(max_iterations):
+        def direction_func(eps_x_stage,eps_z_stage):
+            grad_x,grad_z, fid = compute_gradient(psi_init,psi_target,basis,state_to_idx,bond_maps,num_sites,onsite_half,bond_half,onsite_half_dag,bond_half_dag,eps_x_stage,eps_z_stage,dr,substeps)
+            return dmorph_direction(eps_x_stage,eps_z_stage,grad_x,grad_z)
+
+        old_fluence = fluence(eps_x_T,eps_z_T,dt)
+        new_eps_x,new_eps_z,h_used,h_next = rk45_step(eps_x_T,eps_z_T,h,direction_func)
+        new_fidelity = evaluate_fidelity(psi_init,psi_target,basis,state_to_idx,bond_maps,num_sites,onsite_half,bond_half,new_eps_x,new_eps_z,dr,substeps)
+
+        if new_fidelity<target_fidelity:
+            dmorph_fluence = fluence(new_eps_x, new_eps_z, dt)
+            fid_history, step_history, new_eps_x, new_eps_z = optimize(psi_init,psi_target,basis,state_to_idx,bond_maps,num_sites,onsite_half,bond_half,onsite_half_dag,bond_half_dag,new_eps_x,new_eps_z,dr,substeps,ds=0.05,max_iterations=100,target_fidelity=0.9901,verbose=True)
+            new_fidelity = evaluate_fidelity(psi_init,psi_target,basis,state_to_idx,bond_maps,num_sites,onsite_half,bond_half,new_eps_x,new_eps_z,dr,substeps)
+            if new_fidelity<target_fidelity:
+                print("OCT could not get back above 0.99 level set.")
+                break
+            if dmorph_fluence < old_fluence and fluence(new_eps_x, new_eps_z, dt) > old_fluence:
+                print("Trying more D-MORPH because OCT increased it")
+                fidelity_history.append(new_fidelity)
+                fluence_history.append(fluence(new_eps_x, new_eps_z, dt))
+                ds_history.append(h_used)
+                for i in range(3):
+                    new_eps_x, new_eps_z, h_used, h_next = rk45_step(new_eps_x, new_eps_z, h_next, direction_func)
+                    new_fidelity = evaluate_fidelity(psi_init, psi_target, basis, state_to_idx, bond_maps, num_sites, onsite_half, bond_half, new_eps_x, new_eps_z, dr, substeps)
+                    if new_fidelity<target_fidelity:
+                        fid_hist, step_histy, new_eps_x, new_eps_z = optimize(psi_init,psi_target,basis,state_to_idx,bond_maps,num_sites,onsite_half,bond_half,onsite_half_dag,bond_half_dag,new_eps_x,new_eps_z,dr,substeps,ds=0.05,max_iterations=100,target_fidelity=0.9901,verbose=True)
+                        new_fidelity = evaluate_fidelity(psi_init, psi_target, basis,state_to_idx, bond_maps,num_sites,onsite_half, bond_half,new_eps_x, new_eps_z,dr, substeps)
+                    if new_fidelity<target_fidelity:
+                        print("Could not restore fidelity")
+                        return fidelity_history,fluence_history,ds_history,best_eps_x,best_eps_z
+                    if fluence(new_eps_x, new_eps_z, dt)<old_fluence:
+                        print("Fluence recovered")
+                        break
+                    fidelity_history.append(new_fidelity)
+                    fluence_history.append(fluence(new_eps_x, new_eps_z, dt))
+                    ds_history.append(h_used)
+                else:
+                    print("Fluence did not recover after three additional D-MORPH steps")
+                    return fidelity_history, fluence_history, ds_history, best_eps_x, best_eps_z
+        
+        new_fluence = fluence(new_eps_x, new_eps_z, dt)
+        percent = (best_fluence-new_fluence)/best_fluence
+        eps_x_T = new_eps_x
+        eps_z_T = new_eps_z
+        h=h_next
+        fidelity_history.append(new_fidelity)
+        fluence_history.append(new_fluence)
+        ds_history.append(h_used)
+        
+        if new_fluence < best_fluence:
+            best_fluence = new_fluence
+            best_eps_x = new_eps_x.copy()
+            best_eps_z = new_eps_z.copy()
+        if percent >= fluence_tolerance:
+            counter = 0
+        else:
+            counter += 1
+        if counter>no_change_iterations:
+            print(f"DMORPH stopped after {counter} iterations due to no improvement")
+            break
+
+    return fidelity_history, fluence_history, ds_history, best_eps_x, best_eps_z
